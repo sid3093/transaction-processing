@@ -30,6 +30,8 @@ public class TransactionService {
     }
 
     // @Transactional: everything in here commits together or not at all.
+    // If any exception escapes, Spring rolls back every change.
+    // Row locks taken below are held until this method returns.
     @Transactional
     public BankTransaction process(TransactionRequest request) {
         return switch (request.type()) {
@@ -40,7 +42,7 @@ public class TransactionService {
     }
 
     private BankTransaction deposit(TransactionRequest req) {
-        Account to = load(require(req.toAccountId(), "toAccountId is required for DEPOSIT"));
+        Account to = lock(require(req.toAccountId(), "toAccountId is required for DEPOSIT"));
         BigDecimal amount = req.amount();
 
         Optional<String> failure = validator.checkDeposit(amount, to);
@@ -55,9 +57,11 @@ public class TransactionService {
     }
 
     private BankTransaction withdraw(TransactionRequest req) {
-        Account from = load(require(req.fromAccountId(), "fromAccountId is required for WITHDRAWAL"));
+        Account from = lock(require(req.fromAccountId(), "fromAccountId is required for WITHDRAWAL"));
         BigDecimal amount = req.amount();
 
+        // The balance check happens AFTER the lock, so nobody can spend
+        // the same money between our check and our update.
         Optional<String> failure = validator.checkWithdrawal(amount, from);
         if (failure.isPresent()) {
             return reject(TransactionType.WITHDRAWAL, amount, from.getCurrency(), from, null, failure.get());
@@ -74,8 +78,21 @@ public class TransactionService {
         Long toId = require(req.toAccountId(), "toAccountId is required for TRANSFER");
         BigDecimal amount = req.amount();
 
-        Account from = load(fromId);
-        Account to = load(toId);
+        // DEADLOCK AVOIDANCE: always lock the lower id first.
+        // If thread 1 locked A then waited for B, while thread 2 locked B then
+        // waited for A, both would wait forever. A fixed order makes that impossible.
+        Account from;
+        Account to;
+        if (fromId.equals(toId)) {
+            from = lock(fromId);
+            to = from;
+        } else if (fromId < toId) {
+            from = lock(fromId);
+            to = lock(toId);
+        } else {
+            to = lock(toId);
+            from = lock(fromId);
+        }
 
         Optional<String> failure = validator.checkTransfer(amount, from, to);
         if (failure.isPresent()) {
@@ -90,8 +107,8 @@ public class TransactionService {
         return tx;
     }
 
-    private Account load(Long id) {
-        return accounts.findById(id)
+    private Account lock(Long id) {
+        return accounts.findByIdForUpdate(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Account " + id + " not found"));
     }
 
